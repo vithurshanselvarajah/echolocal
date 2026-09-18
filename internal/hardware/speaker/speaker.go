@@ -49,8 +49,13 @@ const (
 	Card           = 0
 	PlaybackDevice = 23
 
-	// AmpSwitch gates the speaker.
+	// AmpSwitch gates the external speaker amplifier (the headphone jack on biscuit, the
+	// ext jack on radar).
 	AmpSwitch = "Ext_Speaker_Amp_Switch"
+
+	// SpeakerAmpSwitch gates the internal speaker driver, a separate signal on radar that
+	// biscuit does not expose. Writes to it on biscuit fail and continue without aborting.
+	SpeakerAmpSwitch = "Speaker_Amp_Switch"
 )
 
 // Player owns the speaker: one playback stream held open for the life of the process, with the
@@ -212,7 +217,10 @@ func (p *Player) route() {
 	p.apply(pathSequence[p.out])
 }
 
-// amp switches the speaker amplifier.
+// amp switches the speaker amplifier(s). Radar exposes both an internal driver (SpeakerAmpSwitch)
+// and an external jack amp (AmpSwitch); biscuit only has the external one, where the internal and
+// jack share a single gate. Writing both keeps the path sequence the only place that names them,
+// and a missing control on either device logs and continues rather than aborts.
 func (p *Player) amp(on bool) {
 	p.pathMu.Lock()
 	defer p.pathMu.Unlock()
@@ -224,7 +232,10 @@ func (p *Player) amp(on bool) {
 	if on {
 		value = "On"
 	}
-	p.apply([]kctl{{name: AmpSwitch, value: value}})
+	p.apply([]kctl{
+		{name: SpeakerAmpSwitch, value: value},
+		{name: AmpSwitch, value: value},
+	})
 }
 
 // Output reports which output the player is driving.
