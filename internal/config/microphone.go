@@ -5,6 +5,9 @@ type Microphone struct {
 	Muted     bool `json:"muted"`
 	LEDBright bool `json:"led_bright"`
 
+	// MuteSound is what muting and unmuting sound like.
+	MuteSound Tone `json:"mute_sound"`
+
 	// Gain is the analog gain on the array's converters, in dB.
 	Gain int `json:"gain"`
 
@@ -31,6 +34,7 @@ const (
 	// nothing saying so, is worse than either.
 	DefaultMuted     = false
 	DefaultLEDBright = true
+	DefaultMuteSound = ToneMuteSwitch
 
 	// Analog gain on the array in dB, where the vendor ran it.
 	DefaultMicGain = 20
@@ -53,6 +57,7 @@ func defaultMicrophone() Microphone {
 	return Microphone{
 		Muted:       DefaultMuted,
 		LEDBright:   DefaultLEDBright,
+		MuteSound:   DefaultMuteSound,
 		Gain:        DefaultMicGain,
 		Leveling:    DefaultLeveling,
 		Mixing:      DefaultMixing,
@@ -70,6 +75,10 @@ func (w MicrophoneWriter) Muted(v bool) error {
 
 func (w MicrophoneWriter) LEDBright(v bool) error {
 	return w.st.Update(func(c *Config) { c.Microphone.LEDBright = v })
+}
+
+func (w MicrophoneWriter) MuteSound(v Tone) error {
+	return w.st.Update(func(c *Config) { c.Microphone.MuteSound = v })
 }
 
 func (w MicrophoneWriter) Gain(db int) error {
