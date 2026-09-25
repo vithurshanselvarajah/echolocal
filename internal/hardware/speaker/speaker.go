@@ -36,6 +36,12 @@ const (
 	// codecSettle is how long the codec sits powered and idle before the amplifier is enabled,
 	// measured from the vendor HAL doing the same thing on a route change.
 	codecSettle = 1100 * time.Millisecond
+
+	// ampIdleThreshold is how long the write loop must see nothing to queue or render before the
+	// speaker amplifier is gated off. Short enough that a track ending turns the amp off before
+	// the room registers the gap, long enough that a one-period splice inside a track does not
+	// gate the amp on every gap.
+	ampIdleThreshold = 250 * time.Millisecond
 )
 
 // VoiceRate is the rate Home Assistant's pipeline works at, and VoiceUpsample how many playback
@@ -70,8 +76,22 @@ type Player struct {
 	// Output changed: a headphone was plugged in or pulled out.
 	OnOutput hook.Hook[Output]
 
+	// OnAmp fires when the speaker amplifier is enabled or disabled, so the diagnostics can show
+	// what the room is hearing. Same shape as OnOutput.
+	OnAmp hook.Hook[bool]
+
 	volume atomic.Uint32 // linear gain, derived from step and the current output's curve
 	step   atomic.Int32
+
+	// AmpOn is whether the speaker amplifier is currently enabled. Idle gating drives it false once
+	// nothing has been queued or rendered for ampIdleThreshold, and writers drive it back on as soon
+	// as audio arrives. The write loop is the only writer; readers use it as a snapshot.
+	AmpOn atomic.Bool
+
+	// IdleSince is the unix-nanosecond timestamp at which the write loop last saw no audio pending
+	// and no Source attached. Zero means the loop has not seen idle yet, which is what the boot path
+	// looks like before its first fill. The write loop is the only writer.
+	IdleSince atomic.Int64
 
 	pathMu sync.Mutex
 	out    Output
