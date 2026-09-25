@@ -242,11 +242,20 @@ func (p *Player) route() {
 // and an external jack amp (AmpSwitch); biscuit only has the external one, where the internal and
 // jack share a single gate. Writing both keeps the path sequence the only place that names them,
 // and a missing control on either device logs and continues rather than aborts.
+//
+// The amplifier state is published through AmpOn and OnAmp so the write loop and any listener can
+// react; amp is the only place that touches the hardware, and the write loop is the only caller.
 func (p *Player) amp(on bool) {
 	p.pathMu.Lock()
 	defer p.pathMu.Unlock()
 
 	if p.out != OutputSpeaker {
+		// Headphone output does not gate: the headphone amp is the codec's own, and toggling it pops.
+		// Reflect the intent so the write loop and diagnostics agree, even though the hardware stays
+		// on.
+		if prev := p.AmpOn.Swap(on); prev != on {
+			p.OnAmp.Emit(on)
+		}
 		return
 	}
 	value := "Off"
@@ -257,6 +266,9 @@ func (p *Player) amp(on bool) {
 		{name: SpeakerAmpSwitch, value: value},
 		{name: AmpSwitch, value: value},
 	})
+	if prev := p.AmpOn.Swap(on); prev != on {
+		p.OnAmp.Emit(on)
+	}
 }
 
 // Output reports which output the player is driving.
@@ -358,6 +370,16 @@ func (p *Player) Run(ctx context.Context) error {
 		}
 
 		p.fill(buf)
+
+		// After fill, the queue and the Source are both empty iff this period was silence. That is
+		// the moment to start the idle clock; the gate-off happens on the next iteration so one more
+		// silent period drives the codec to DC before the amp is opened.
+		if since := p.IdleSince.Load(); since != 0 &&
+			p.AmpOn.Load() &&
+			time.Now().UnixNano()-since >= int64(ampIdleThreshold) {
+			p.amp(false)
+		}
+
 		if err := p.send(ctx, pb, buf); err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -392,6 +414,7 @@ func (p *Player) send(ctx context.Context, to io.Writer, buf []byte) error {
 // fill takes what is queued and pads the rest with silence.
 func (p *Player) fill(buf []byte) {
 	p.mu.Lock()
+	hadQueued := len(p.pending) > 0
 	take := min(len(p.pending), period*Channels)
 	chunk := p.pending[:take]
 	p.pending = p.pending[take:]
@@ -415,12 +438,24 @@ func (p *Player) fill(buf []byte) {
 	// everything panned left. The line-out is not: it gets both channels as they came.
 	mono := p.Output() == OutputSpeaker
 
-	// The write loop runs whether or not anything is playing, since the amplifier hisses when nothing
-	// drives the DAC, and tuning silence costs what tuning music costs. The block after the audio stops
-	// still goes through: that is the filter's own length, and it holds the tail.
+	// The write loop runs whether or not anything is playing. The amplifier is gated off after
+	// ampIdleThreshold of continuous silence; the DAC is still driven with zeros so toggling the
+	// amp does not pop the speaker.
 	fed := take > 0 || len(rendered) > 0
 	drain := fed || p.fed
 	p.fed = fed
+
+	// Idle means this period had no queued audio, no live Source, and nothing on the queue. The
+	// write loop uses IdleSince to decide when to gate the amp off; clearing it on activity keeps
+	// a Source running across the threshold from being shut down mid-stream.
+	p.srcMu.Lock()
+	hasSource := p.src != nil
+	p.srcMu.Unlock()
+	if !fed && !hadQueued && !hasSource {
+		p.IdleSince.CompareAndSwap(0, time.Now().UnixNano())
+	} else {
+		p.IdleSince.Store(0)
+	}
 
 	// The tuning is for the driver, so the line-out is left with what it was sent.
 	tuned := mono && p.chains != nil && p.on.Load() && drain
