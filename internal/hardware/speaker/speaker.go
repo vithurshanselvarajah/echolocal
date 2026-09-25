@@ -130,6 +130,11 @@ type Player struct {
 	srcMu  sync.Mutex
 	src    Source
 	srcBuf []int16
+
+	// wake is closed by writers when audio arrives and the amp may be off. The write loop picks it
+	// up between fills and runs the re-enable (codecSettle + amp(true)) before draining the queue.
+	// Capacity 1: only one outstanding request matters; the rest collapse into the same gate.
+	wake chan struct{}
 }
 
 // Source is asked for the frames the card is about to play, addressed by absolute output frame index.
@@ -141,11 +146,24 @@ type Source interface {
 }
 
 // Attach sets the Source, or clears it with nil. Only one at a time: two things placing audio by
-// absolute frame would be two things deciding what the room plays.
+// absolute frame would be two things deciding what the room plays. A non-nil Source wakes the
+// amplifier, since the first Render will go through the codec immediately.
 func (p *Player) Attach(s Source) {
 	p.srcMu.Lock()
-	defer p.srcMu.Unlock()
 	p.src = s
+	p.srcMu.Unlock()
+	if s != nil {
+		p.requestWake()
+	}
+}
+
+// requestWake asks the write loop to ensure the amplifier is on. Cheap when it already is; one
+// drain and re-enable when it is not, the same way the boot path does it after codecSettle.
+func (p *Player) requestWake() {
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Written is the output frame index of the next frame to be handed to the card.
@@ -154,7 +172,7 @@ func (p *Player) Written() uint64 { return p.written.Load() }
 // New makes the speaker without taking the hardware, so callers can hold it before there is anything
 // to play through. Audio queued before Start waits; Volume and the rest work throughout.
 func New() *Player {
-	p := &Player{out: DetectOutput()}
+	p := &Player{out: DetectOutput(), wake: make(chan struct{}, 1)}
 	p.voice, p.resampling = NewResampler(config.ResampleSinc)
 	p.SetVolume(VolumeSteps)
 	p.on.Store(config.DefaultASP)
@@ -369,6 +387,23 @@ func (p *Player) Run(ctx context.Context) error {
 			return nil
 		}
 
+		// Writers signal when audio has just arrived. If the amp is off, run the same enable
+		// sequence the boot path does: codecSettle, then amp(true), then the next fill drains the
+		// queue. While we wait, the DAC is still being driven with zeros so the codec settles
+		// instead of popping when the amp flips on.
+		select {
+		case <-p.wake:
+			if !p.AmpOn.Load() {
+				p.amp(true)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(codecSettle):
+				}
+			}
+		default:
+		}
+
 		p.fill(buf)
 
 		// After fill, the queue and the Source are both empty iff this period was silence. That is
@@ -553,8 +588,15 @@ func (p *Player) Play(samples []int16) {
 	}
 
 	p.mu.Lock()
+	empty := len(p.pending) == 0
 	p.pending = append(p.pending, samples...)
 	p.mu.Unlock()
+
+	// Only wake the amp if the queue was empty before this call: a chunk added to a queue that is
+	// already being drained will land within codecSettle's worth of periods at the current rate.
+	if empty && len(samples) > 0 {
+		p.requestWake()
+	}
 }
 
 // Take empties the queue and hands back what had not been played, so a sound that yields to another
@@ -682,8 +724,13 @@ func (p *Player) Overlay(samples []int16) {
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	empty := len(p.pending) == 0
 	p.pending = mix(p.pending, samples)
+	p.mu.Unlock()
+
+	if empty && len(samples) > 0 {
+		p.requestWake()
+	}
 }
 
 // mix sums add into the front of into, extending it if add outlasts it.
